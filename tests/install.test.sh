@@ -35,4 +35,35 @@ if bash "$project_dir/install.sh" >/dev/null 2>&1; then
   echo 'Symlink destination must be rejected' >&2; exit 1
 fi
 [[ ! -e "$fixture_dir/elsewhere" ]]
-echo 'Installer checks passed: first install, update, spaces, validation failure, settings preservation, symlink guard.'
+rm "$target/hooks/register.js"
+
+# Simulate an authenticated archive download, with no network or real token.
+mkdir "$fixture_dir/archive-root"
+cp -R "$project_dir/.claude-plugin" "$project_dir/hooks" "$project_dir/README.md" "$fixture_dir/archive-root/"
+tar -czf "$fixture_dir/source.tar.gz" -C "$fixture_dir" archive-root
+export INSTALL_TEST_ARCHIVE="$fixture_dir/source.tar.gz"
+cat > "$fixture_dir/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+set -eu
+output=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --header) [[ "$2" == @* && -f "${2#@}" ]]; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[[ "${DOWNLOAD_FAIL:-0}" == 0 ]] || exit 22
+cp "$INSTALL_TEST_ARCHIVE" "$output"
+MOCK
+chmod +x "$fixture_dir/bin/curl"
+export GH_TOKEN='test-only-not-a-real-token'
+cat "$project_dir/install.sh" | bash >/dev/null
+cmp "$project_dir/hooks/register.js" "$target/hooks/register.js"
+[[ ! -e "$target/auth.headers" && ! -e "$target/source.tar.gz" ]]
+echo 'previous version' > "$target/hooks/register.js"
+if cat "$project_dir/install.sh" | DOWNLOAD_FAIL=1 bash >/dev/null 2>&1; then
+  echo 'Download failure must stop installation' >&2; exit 1
+fi
+[[ "$(cat "$target/hooks/register.js")" == 'previous version' ]]
+echo 'Installer checks passed: local install/update, piped remote install, failed download/validation, settings and symlink guards.'

@@ -6,7 +6,18 @@ This native Claude Code mod translates Chinese user prompts into English and fin
 
 ## 使用
 
-克隆私有仓库后，一条命令安装或更新（需要当前 GitHub 账号有仓库权限）：
+**远程一键安装或更新**：这是私有仓库，需要已通过 `gh auth login` 登录有仓库读取权限的账号：
+
+```sh
+curl -fsSL \
+  -H "Authorization: Bearer $(gh auth token --hostname github.com)" \
+  -H 'Accept: application/vnd.github.raw+json' \
+  'https://api.github.com/repos/booiris/claude-translate-mode/contents/install.sh?ref=main' | bash
+```
+
+脚本会自动下载 `main` 分支并安装，无需 git clone。也可以导出 `GH_TOKEN`，把上述认证头改成 `Authorization: Bearer $GH_TOKEN`，安装过程同样使用这个变量。匿名 curl 无法读取私有仓库。
+
+如果已经克隆仓库，也支持本地安装：
 
 ```sh
 git clone git@github.com:booiris/claude-translate-mode.git
