@@ -19,6 +19,7 @@ bash "$project_dir/install.sh" --help >/dev/null
 [[ ! -e "$CLAUDE_CONFIG_DIR" ]]
 bash "$project_dir/install.sh" >/dev/null
 cmp "$project_dir/hooks/register.js" "$target/hooks/register.js"
+cmp "$project_dir/LICENSE" "$target/LICENSE"
 [[ -f "$target/hooks/model_catalog.py" && ! -d "$target/tests" && ! -d "$target/.git" ]]
 echo 'user settings' > "$CLAUDE_CONFIG_DIR/settings.json"
 echo 'old runtime' > "$target/hooks/register.js"
@@ -37,29 +38,39 @@ fi
 [[ ! -e "$fixture_dir/elsewhere" ]]
 rm "$target/hooks/register.js"
 
-# Simulate an authenticated archive download, with no network or real token.
+# Simulate a public archive download, with no network or credentials.
 mkdir "$fixture_dir/archive-root"
-cp -R "$project_dir/.claude-plugin" "$project_dir/hooks" "$project_dir/README.md" "$fixture_dir/archive-root/"
+cp -R "$project_dir/.claude-plugin" "$project_dir/hooks" "$project_dir/README.md" "$project_dir/LICENSE" "$fixture_dir/archive-root/"
 tar -czf "$fixture_dir/source.tar.gz" -C "$fixture_dir" archive-root
 export INSTALL_TEST_ARCHIVE="$fixture_dir/source.tar.gz"
 cat > "$fixture_dir/bin/curl" <<'MOCK'
 #!/usr/bin/env bash
 set -eu
 output=''
+url=''
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) output="$2"; shift 2 ;;
-    --header) [[ "$2" == @* && -f "${2#@}" ]]; shift 2 ;;
+    --header) echo 'Public downloads must not send credentials' >&2; exit 1 ;;
+    https://*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
+[[ "$url" == 'https://codeload.github.com/booiris/claude-translate-cn-mod/tar.gz/refs/heads/main' ]]
 [[ "${DOWNLOAD_FAIL:-0}" == 0 ]] || exit 22
 cp "$INSTALL_TEST_ARCHIVE" "$output"
 MOCK
 chmod +x "$fixture_dir/bin/curl"
-export GH_TOKEN='test-only-not-a-real-token'
+cat > "$fixture_dir/bin/gh" <<'MOCK'
+#!/usr/bin/env bash
+echo 'Public installation must not request GitHub authentication' >&2
+exit 1
+MOCK
+chmod +x "$fixture_dir/bin/gh"
+unset GH_TOKEN GITHUB_TOKEN
 cat "$project_dir/install.sh" | bash >/dev/null
 cmp "$project_dir/hooks/register.js" "$target/hooks/register.js"
+cmp "$project_dir/LICENSE" "$target/LICENSE"
 [[ ! -e "$target/auth.headers" && ! -e "$target/source.tar.gz" ]]
 echo 'previous version' > "$target/hooks/register.js"
 if cat "$project_dir/install.sh" | DOWNLOAD_FAIL=1 bash >/dev/null 2>&1; then

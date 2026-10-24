@@ -1,13 +1,50 @@
 {
   "name": "codex-translate",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Translate Chinese prompts and Claude's final replies with session-aware Codex CLI.",
   "userConfig": {
-    "input_translation": { "type": "boolean", "title": "中文输入翻译", "description": "发送前将包含中文的输入译为英文，同时保留原始输入", "default": true },
-    "output_translation": { "type": "boolean", "title": "最终回复翻译", "description": "在最终回复下显示中文译文", "default": true },
-    "translation_context": { "type": "boolean", "title": "翻译上下文", "description": "携带 Claude 会话历史并复用 Codex 会话；关闭后使用无历史的临时会话", "default": true },
-    "codex_model": { "type": "string", "title": "Codex 模型", "description": "模型 ID；留空沿用 Codex 默认模型", "default": "" },
-    "codex_binary": { "type": "string", "title": "Codex 可执行文件", "description": "codex 命令或绝对路径，不包含参数", "default": "codex" },
-    "timeout_ms": { "type": "number", "title": "翻译超时", "description": "单次 Codex 调用超时（毫秒）", "default": 120000, "min": 1000, "max": 600000 }
-  }
+    "input_translation": {
+      "type": "boolean",
+      "title": "中文输入翻译",
+      "description": "发送前将包含中文的输入译为英文，同时保留原始输入",
+      "default": true
+    },
+    "output_translation": {
+      "type": "boolean",
+      "title": "最终回复翻译",
+      "description": "在最终回复下显示中文译文",
+      "default": true
+    },
+    "translation_context": {
+      "type": "boolean",
+      "title": "翻译上下文",
+      "description": "携带 Claude 会话历史并复用 Codex 会话；默认关闭，使用无历史的临时会话",
+      "default": false
+    },
+    "codex_model": {
+      "type": "string",
+      "title": "Codex 模型",
+      "description": "模型 ID；留空沿用 Codex 默认模型",
+      "default": ""
+    },
+    "codex_binary": {
+      "type": "string",
+      "title": "Codex 可执行文件",
+      "description": "codex 命令或绝对路径，不包含参数",
+      "default": "codex"
+    },
+    "timeout_ms": {
+      "type": "number",
+      "title": "翻译超时",
+      "description": "单次 Codex 调用超时（毫秒）",
+      "default": 120000,
+      "min": 1000,
+      "max": 600000
+    }
+  },
+  "license": "MIT",
+  "author": {
+    "name": "booiris"
+  },
+  "repository": "https://github.com/booiris/claude-translate-cn-mod"
 }

@@ -57,6 +57,44 @@ export function parseCodexResult(result, withSession = false) {
   return withSession ? { text: answer, sessionId } : answer;
 }
 
+function waitWithSignal(promise, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => { cleanup(); reject(new Error('翻译已取消')); };
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) abort();
+  });
+}
+
+async function runTranslation($, argv, init, signal) {
+  if (signal.aborted) throw new Error('翻译已取消');
+  const stream = $.process.spawn({ argv, cwd: init.cwd, input: init.stdin });
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = $.clock.after(init.timeoutMs, () => reject(new Error('Codex 翻译超时')));
+    });
+    const read = async () => {
+      let stdout = '';
+      while (true) {
+        const chunk = await stream.next();
+        if (chunk.done) return { exitCode: chunk.value?.code ?? 1, stdout, stderr: '' };
+        if (chunk.value.stream === 'stdout') {
+          stdout += chunk.value.text;
+          if (stdout.length > 4 * 1024 * 1024) throw new Error('Codex 翻译输出过长');
+        }
+      }
+    };
+    return await waitWithSignal(Promise.race([read(), timeout]), signal);
+  } finally {
+    timer?.cancel();
+    // The Mods streaming process API kills the child when its stream closes.
+    // Close the stream before allowing another call to resume the same session.
+    await stream.return().catch(() => {});
+  }
+}
+
 async function translate($, text, target, config, paths, queues, signal) {
   if (!config.context) {
     if (signal.aborted) throw new Error('翻译已取消');
@@ -65,17 +103,18 @@ async function translate($, text, target, config, paths, queues, signal) {
       '-c', 'project_doc_max_bytes=0'];
     if (config.model) argv.push('--model', config.model);
     argv.push('-');
-    return parseCodexResult(await $.process.run(argv, {
+    return parseCodexResult(await runTranslation($, argv, {
       stdin: translationPrompt(text, target), timeoutMs: config.timeout,
-    }));
+    }, signal));
   }
   const sessionId = await $.session.id();
   const previous = queues.get(sessionId) || Promise.resolve();
   let release;
-  const pending = new Promise(resolve => { release = resolve; });
+  const slot = new Promise(resolve => { release = resolve; });
+  const pending = previous.then(() => slot);
   queues.set(sessionId, pending);
-  await previous;
   try {
+    await waitWithSignal(previous, signal);
     if (signal.aborted) throw new Error('翻译已取消');
     const key = `codex-session:${sessionId}`;
     const saved = await $.store.get(key);
@@ -88,11 +127,11 @@ async function translate($, text, target, config, paths, queues, signal) {
     if (config.model) argv.push('--model', config.model);
     if (resumeId) argv.push('resume', resumeId);
     argv.push('-');
-    const result = await $.process.run(argv, {
+    const result = await runTranslation($, argv, {
       cwd,
       stdin: translationPrompt(text, target, sessionId, paths.get(sessionId), messages),
       timeoutMs: config.timeout,
-    });
+    }, signal);
     const parsed = parseCodexResult(result, true);
     const id = parsed.sessionId || resumeId;
     if (!id) throw new Error('Codex 未返回会话 ID');
@@ -100,7 +139,9 @@ async function translate($, text, target, config, paths, queues, signal) {
     return parsed.text;
   } finally {
     release();
-    if (queues.get(sessionId) === pending) queues.delete(sessionId);
+    void pending.then(() => {
+      if (queues.get(sessionId) === pending) queues.delete(sessionId);
+    });
   }
 }
 
@@ -208,11 +249,76 @@ function renderPanel($, e, state) {
   return Box({ flexDirection: 'column', gap: 1, paddingX: 1, children });
 }
 
+// UI-only cache; never included in translationPrompt or session messages.
+const validCard = card => card && ['input', 'output'].includes(card.kind) &&
+  typeof card.sessionId === 'string' && typeof card.messageId === 'string' &&
+  typeof card.original === 'string' && typeof card.translated === 'string' &&
+  (card.kind === 'input' || typeof card.lastBlock === 'string');
+function loadHistory($, cache) {
+  if (!cache.ready) cache.ready = (async () => {
+    try {
+      const saved = await $.store.get('translation-ui:v1');
+      if (saved?.version === 1 && Array.isArray(saved.cards)) cache.cards = saved.cards.filter(validCard);
+    } catch {
+      cache.writable = false;
+      $.ui.toast('翻译显示缓存读取失败；本次翻译仍可使用，但旧译文暂时无法恢复。');
+    }
+  })();
+  return cache.ready;
+}
+async function restorePanel($, panel, cache) {
+  await loadHistory($, cache);
+  const sessionId = await $.session.id();
+  if (panel.sessionId !== sessionId) {
+    panel.cards = []; panel.selected = 0; panel.page = 0; panel.showOriginal = false;
+    panel.sessionId = sessionId;
+    panel.lastAssistant = null;
+    for (const card of cache.cards.filter(card => card.sessionId === sessionId)) {
+      addCard(panel, { ...card, ...(card.kind === 'input' ? { submitted: card.translated } : {}) });
+    }
+  }
+  return sessionId;
+}
+async function saveCard($, cache, sessionId, card) {
+  if (!card.messageId || (card.kind === 'output' && typeof card.lastBlock !== 'string')) return;
+  await loadHistory($, cache);
+  if (!cache.writable) return;
+  const saved = { sessionId, messageId: card.messageId, kind: card.kind,
+    original: card.original, translated: card.translated,
+    ...(card.kind === 'output' ? { lastBlock: card.lastBlock } : {}) };
+  if (JSON.stringify({ version: 1, cards: [saved] }).length > 800000) {
+    $.ui.toast('这条译文超过显示缓存容量，当前仍可查看，但恢复会话后无法自动显示。');
+    return;
+  }
+  cache.cards = cache.cards.filter(item => !(item.sessionId === sessionId &&
+    item.messageId === card.messageId && item.kind === card.kind));
+  cache.cards.push(saved);
+  // $.store has a 4 MiB total limit. Reserve space for Codex associations;
+  // 800k UTF-16 units of JSON occupy at most 2.4 MB of UTF-8.
+  let serialized = JSON.stringify({ version: 1, cards: cache.cards });
+  while (serialized.length > 800000 && cache.cards.length) {
+    cache.cards.shift();
+    serialized = JSON.stringify({ version: 1, cards: cache.cards });
+  }
+  const snapshot = JSON.parse(serialized);
+  cache.writes = cache.writes.then(() => $.store.set('translation-ui:v1', snapshot)).catch(() => {
+    if (!cache.warning) {
+      cache.warning = true;
+      $.ui.toast('译文已显示，但本地缓存保存失败；恢复会话时可能无法显示这次译文。');
+    }
+  });
+  await cache.writes;
+}
+async function savedCard($, panel, cache, kind, messageId) {
+  const sessionId = await restorePanel($, panel, cache);
+  return cache.cards.findLast(card => card.sessionId === sessionId &&
+    card.kind === kind && card.messageId === messageId);
+}
 export function register(on, options = {}) {
   const config = {
     input: options.input_translation ?? true,
     output: options.output_translation ?? true,
-    context: options.translation_context ?? true,
+    context: options.translation_context ?? false,
     model: options.codex_model || '',
     binary: options.codex_binary || 'codex',
     timeout: Math.min(600000, Math.max(1000, Number(options.timeout_ms) || 120000)),
@@ -220,33 +326,36 @@ export function register(on, options = {}) {
   const paths = new Map();
   const completed = new Set();
   const queues = new Map();
-  const panel = { cards: [], selected: 0, page: 0, showOriginal: false, sessionId: null };
-  let lastAssistant = null;
+  const panel = { cards: [], selected: 0, page: 0, showOriginal: false, sessionId: null, lastAssistant: null };
   const progress = { jobs: new Map(), sequence: 0, frame: 0, timer: null };
+  const cache = { cards: [], ready: null, writable: true, warning: false, writes: Promise.resolve() };
 
   on('turn.start', async ($, e, next) => {
-    lastAssistant = null;
+    panel.lastAssistant = null;
     return next(e);
   });
 
   on('classic.SessionStart', async ($, e, next) => {
-    if (panel.sessionId !== e.session_id) {
-      panel.cards = []; panel.selected = 0; panel.page = 0; panel.sessionId = e.session_id;
-      lastAssistant = null;
-      $.ui.invalidate('ui.render');
-    }
     paths.set(e.session_id, e.transcript_path);
-    return next(e);
+    const result = await next(e);
+    await restorePanel($, panel, cache);
+    $.ui.invalidate('ui.render');
+    return result;
   });
   on('session.append', async ($, e, next) => {
     const result = await next(e);
+    if (e.agentId) return result;
+    const sessionId = await restorePanel($, panel, cache);
     if (!e.agentId && result.message?.type === 'assistant') {
       const texts = result.message.content.filter(block => block.type === 'text').map(block => block.text);
-      lastAssistant = { id: result.uuid, texts };
+      panel.lastAssistant = { id: result.uuid, texts };
     } else if (!e.agentId && result.message?.type === 'user') {
       const text = result.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n');
       const card = panel.cards.findLast(item => item.kind === 'input' && !item.messageId && item.submitted === text);
-      if (card) card.messageId = result.uuid;
+      if (card) {
+        card.messageId = result.uuid;
+        await saveCard($, cache, sessionId, card);
+      }
     }
     return result;
   });
@@ -262,12 +371,16 @@ export function register(on, options = {}) {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'translate', description: 'Codex 翻译开关及模型设置',
       argumentHint: '[show | hide | status | input/output/context on/off | model [ID/default] | models | reset]' });
-    return next(e);
+    const result = await next(e);
+    await restorePanel($, panel, cache);
+    $.ui.invalidate('ui.render');
+    return result;
   });
   on('command.run', { command: 'translate' }, async ($, e) => {
     const [action = 'status', ...rest] = e.args.trim().split(/\s+/).filter(Boolean);
     const value = rest.join(' ');
     if (action === 'show' && !value) {
+      await restorePanel($, panel, cache);
       await openPanel($);
       return {};
     } else if (action === 'hide' && !value) {
@@ -303,6 +416,7 @@ export function register(on, options = {}) {
   on('prompt.submit', async ($, e, next) => {
     if (!['composer', 'bridge', 'sdk'].includes(e.origin?.kind)) return next(e);
     if (!config.input || !containsChinese(e.text)) return next(e);
+    const sessionId = await restorePanel($, panel, cache);
     let text;
     const job = beginProgress($, progress, 'input', config);
     try {
@@ -315,7 +429,9 @@ export function register(on, options = {}) {
     }
     if (next.signal.aborted) return { drop: '翻译已取消' };
     // Original is UI-only state. Never append it to Claude's prompt or context.
-    addCard(panel, { kind: 'input', original: e.text, translated: text, submitted: text });
+    if (panel.sessionId === sessionId) {
+      addCard(panel, { kind: 'input', original: e.text, translated: text, submitted: text });
+    }
     $.ui.invalidate('ui.render');
     return next({
       ...e,
@@ -342,11 +458,15 @@ export function register(on, options = {}) {
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
     if (e.requestId !== 'translation') return next(e);
     if (e.props.view?.agentId) return next(e);
+    await restorePanel($, panel, cache);
     return renderPanel($, e, panel);
   });
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
-    const card = panel.cards.findLast(item => item.kind === 'input' && item.submitted === e.props.text &&
-      (item.messageId ? item.messageId === e.requestId : true));
+    if (e.props.view?.agentId) return next(e);
+    const restored = await savedCard($, panel, cache, 'input', e.requestId);
+    const card = restored?.translated === e.props.text ? restored :
+      panel.cards.findLast(item => item.kind === 'input' && item.submitted === e.props.text &&
+        (item.messageId ? item.messageId === e.requestId : true));
     if (!card) return next(e);
     const original = await next({ ...e, props: { ...e.props, text: card.original } });
     const { Box, Markdown } = $.ui.resolve(e);
@@ -358,7 +478,9 @@ export function register(on, options = {}) {
     ] });
   });
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
-    const card = panel.cards.find(item => item.kind === 'output' && item.messageId === e.requestId);
+    if (e.props.view?.agentId) return next(e);
+    const restored = await savedCard($, panel, cache, 'output', e.requestId);
+    const card = restored || panel.cards.find(item => item.kind === 'output' && item.messageId === e.requestId);
     // A reply may contain several text blocks. Append only beneath its last one.
     if (!card || e.props.text !== card.lastBlock) return next(e);
     return next({ ...e, props: { ...e.props,
@@ -368,18 +490,21 @@ export function register(on, options = {}) {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e);
     if (!config.output || e.agentId || e.isAborted || !['answer', 'refusal'].includes(e.reason) || !e.answer.trim()) return result;
-    const key = `${await $.session.id()}:${e.turnId}`;
+    const sessionId = await restorePanel($, panel, cache);
+    const key = `${sessionId}:${e.turnId}`;
     if (completed.has(key)) return result;
     completed.add(key);
     if (completed.size > 256) completed.delete(completed.values().next().value);
     // Snapshot before awaiting Codex: a later turn must not steal this reply's ID.
-    const reply = lastAssistant;
+    const reply = panel.lastAssistant;
     const job = beginProgress($, progress, 'output', config);
     try {
       const text = await translate($, e.answer, 'zh', { ...config }, paths, queues, next.signal);
       if (next.signal.aborted) return result;
-      addCard(panel, { kind: 'output', original: e.answer, translated: text,
-        messageId: reply?.id, lastBlock: reply?.texts.at(-1) });
+      const card = { kind: 'output', original: e.answer, translated: text,
+        messageId: reply?.id, lastBlock: reply?.texts.at(-1) };
+      if (panel.sessionId === sessionId) addCard(panel, card);
+      await saveCard($, cache, sessionId, card);
       if ((await $.session.surfaces()).length) {
         $.ui.invalidate('ui.render');
         if (!reply?.id) $.ui.toast('中文译文已完成，输入 /translate show 查看。');
@@ -390,6 +515,7 @@ export function register(on, options = {}) {
       return result;
     } catch {
       completed.delete(key);
+      if (next.signal.aborted) return result;
       $.ui.toast('最终回复翻译失败，原文已保留；检查 Codex 登录、模型和超时；会话已删除时用 /translate reset。');
       return result;
     } finally {

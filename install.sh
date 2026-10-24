@@ -25,22 +25,9 @@ fi
 if [[ -z "$source_dir" || ! -f "$source_dir/.claude-plugin/plugin.json" ]]; then
   command -v curl >/dev/null 2>&1 || { echo '远程安装需要 curl。' >&2; exit 1; }
   command -v tar >/dev/null 2>&1 || { echo '远程安装需要 tar。' >&2; exit 1; }
-  github_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-  if [[ -z "$github_token" ]] && command -v gh >/dev/null 2>&1; then
-    github_token="$(gh auth token --hostname github.com 2>/dev/null || true)"
-  fi
-  if [[ -z "$github_token" ]]; then
-    echo '这是私有仓库：请先 gh auth login，或设置有仓库读取权限的 GH_TOKEN。' >&2
-    exit 1
-  fi
-  # Keep the archive request's token out of argv and remove it with the temp dir.
-  printf 'Authorization: Bearer %s\n' "$github_token" > "$stage_dir/auth.headers"
-  chmod 600 "$stage_dir/auth.headers"
-  unset github_token
   curl --fail --silent --show-error --location --retry 2 \
-    --header "@$stage_dir/auth.headers" \
     --output "$stage_dir/source.tar.gz" \
-    'https://api.github.com/repos/booiris/claude-translate-mode/tarball/main'
+    'https://codeload.github.com/booiris/claude-translate-cn-mod/tar.gz/refs/heads/main'
   mkdir "$stage_dir/source"
   tar -xzf "$stage_dir/source.tar.gz" -C "$stage_dir/source" --strip-components=1
   source_dir="$stage_dir/source"
@@ -54,11 +41,12 @@ for name in hooks.json register.js model_catalog.py; do
   cp "$source_dir/hooks/$name" "$runtime_dir/hooks/"
 done
 cp "$source_dir/README.md" "$runtime_dir/"
+cp "$source_dir/LICENSE" "$runtime_dir/"
 claude plugin validate "$runtime_dir" </dev/null
 
 # Do not follow existing plugin symlinks when updating files.
 for relative in '' '/.claude-plugin' '/hooks' '/.claude-plugin/plugin.json' \
-  '/hooks/hooks.json' '/hooks/register.js' '/hooks/model_catalog.py' '/README.md'; do
+  '/hooks/hooks.json' '/hooks/register.js' '/hooks/model_catalog.py' '/README.md' '/LICENSE'; do
   if [[ -L "$target_dir$relative" ]]; then
     echo "安装目标含符号链接，请先检查并移除该链接：$target_dir$relative" >&2
     exit 1
@@ -68,6 +56,7 @@ mkdir -p "$target_dir/.claude-plugin" "$target_dir/hooks"
 cp "$runtime_dir/.claude-plugin/plugin.json" "$target_dir/.claude-plugin/"
 cp "$runtime_dir/hooks/"* "$target_dir/hooks/"
 cp "$runtime_dir/README.md" "$target_dir/"
+cp "$runtime_dir/LICENSE" "$target_dir/"
 
 echo "已安装：$target_dir"
 echo '重启 Claude，然后运行 /translate status。更新插件也运行同一脚本。'

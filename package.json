@@ -1,8 +1,21 @@
 {
   "name": "codex-translate",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node tests/translation.test.js", "test:install": "bash tests/install.test.sh", "test:models": "python3 -m unittest discover -s tests -p 'test_*.py'", "validate": "claude plugin validate .", "test:native": "claude plugin test ." },
-  "engines": { "node": ">=20" }
+  "scripts": {
+    "test": "node tests/translation.test.js",
+    "test:install": "bash tests/install.test.sh",
+    "test:models": "python3 -m unittest discover -s tests -p 'test_*.py'",
+    "validate": "claude plugin validate .",
+    "test:native": "claude plugin test ."
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/booiris/claude-translate-cn-mod.git"
+  }
 }

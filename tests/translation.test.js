@@ -17,13 +17,18 @@ function harness(options = {}, store = new Map()) {
   const opened = [];
   const closed = [];
   const timers = [];
+  const deadlines = [];
   register((name, matcher, handler) => {
     hooks.set(name === 'ui.render' ? `${name}:${matcher.component}` : name, handler || matcher);
     return { catch() {} };
   }, options);
   const $ = {
     plugin: { root: '/plugin' },
-    clock: { every: (ms, tick) => {
+    clock: { after: (ms, tick) => {
+      const timer = { ms, tick, cancelled: false, cancel() { this.cancelled = true; } };
+      deadlines.push(timer);
+      return timer;
+    }, every: (ms, tick) => {
       const timer = { ms, tick, cancelled: false, cancel() { this.cancelled = true; } };
       timers.push(timer);
       return timer;
@@ -38,14 +43,185 @@ function harness(options = {}, store = new Map()) {
       open: async args => opened.push(args), close: async args => closed.push(args),
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Markdown'].map(type => [type, props => ({ type, props })])) },
   };
+  $.process.spawn = async function* ({ argv, cwd, input }) {
+    const result = await $.process.run(argv, { cwd, stdin: input });
+    if (result.stdout) yield { stream: 'stdout', text: result.stdout };
+    return { code: result.exitCode, signal: null };
+  };
   const run = async (name, event, final = async e => e) => {
-    final.signal = new AbortController().signal;
+    final.signal ??= new AbortController().signal;
     return hooks.get(name === 'ui.render' ? `${name}:${event.component}` : name)($, Object.freeze(event), final);
   };
-  return { $, run, calls, notices, logs, store, opened, closed, timers };
+  return { $, run, calls, notices, logs, store, opened, closed, timers, deadlines };
 }
 const prompt = { text: '请修复这个 bug', origin: { kind: 'composer' }, wait: false };
 const finish = { turnId: 't1', answer: 'Fixed the bug.', reason: 'answer', isAborted: false };
+
+function heldProcess(h) {
+  let ready;
+  let finishRead;
+  const started = new Promise(resolve => { ready = resolve; });
+  const pending = new Promise(resolve => { finishRead = resolve; });
+  const child = {
+    closed: false,
+    next() { ready(); return pending; },
+    async return() {
+      this.closed = true;
+      finishRead({ done: true, value: { code: null, signal: 'SIGTERM' } });
+      return { done: true };
+    },
+  };
+  h.$.process.spawn = () => child;
+  return { child, started };
+}
+
+test('cancelling input or output closes the child, clears progress and publishes no translation', async () => {
+  for (const phase of ['prompt.submit', 'turn.complete']) {
+    const h = harness();
+    const { child, started } = heldProcess(h);
+    const controller = new AbortController();
+    const next = Object.assign(async e => e, { signal: controller.signal });
+    const pending = h.run(phase, phase === 'prompt.submit' ? prompt : finish, next);
+    await started;
+    controller.abort();
+    const result = await pending;
+    assert.equal(child.closed, true);
+    if (phase === 'prompt.submit') assert.equal(result.drop, '翻译已取消');
+    else assert.equal(result, finish);
+    assert.equal(h.timers[0].cancelled, true);
+    assert.equal(h.deadlines[0].cancelled, true);
+    assert.deepEqual(h.notices, []);
+    assert.deepEqual(h.logs, []);
+    assert.equal(h.store.has('translation-ui:v1'), false);
+  }
+});
+
+test('translation timeout closes the child and a later request can resume normally', async () => {
+  const h = harness({ translation_context: true, timeout_ms: 1000 });
+  const spawn = h.$.process.spawn;
+  const { child, started } = heldProcess(h);
+  const pending = h.run('prompt.submit', prompt);
+  await started;
+  assert.equal(h.deadlines[0].ms, 1000);
+  h.deadlines[0].tick();
+  assert.ok((await pending).drop);
+  assert.equal(child.closed, true);
+  h.$.process.spawn = spawn;
+  assert.equal((await h.run('prompt.submit', prompt)).text, 'Translated text');
+});
+
+test('cancelling a queued translation is immediate but cannot bypass the running session', async () => {
+  const h = harness({ translation_context: true });
+  let release;
+  let notifyStarted;
+  const started = new Promise(resolve => { notifyStarted = resolve; });
+  const held = new Promise(resolve => { release = resolve; });
+  h.$.process.run = async (argv, init) => {
+    h.calls.push({ argv, init });
+    if (h.calls.length === 1) { notifyStarted(); await held; }
+    return codexResult();
+  };
+  const first = h.run('prompt.submit', prompt);
+  await started;
+  const controller = new AbortController();
+  const next = Object.assign(async e => e, { signal: controller.signal });
+  const second = h.run('prompt.submit', prompt, next);
+  controller.abort();
+  assert.equal((await second).drop, '翻译已取消');
+  const third = h.run('prompt.submit', prompt);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.length, 1);
+  release();
+  await Promise.all([first, third]);
+  assert.equal(h.calls.length, 2);
+});
+
+test('ephemeral translations can run concurrently by default', async () => {
+  const h = harness();
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  h.$.process.run = async (argv, init) => {
+    h.calls.push({ argv, init });
+    await held;
+    return codexResult();
+  };
+  const input = h.run('prompt.submit', prompt);
+  const output = h.run('turn.complete', finish);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.calls.length, 2);
+  assert.ok(h.calls.every(call => call.argv.includes('--ephemeral')));
+  release();
+  await Promise.all([input, output]);
+});
+
+test('resume restores input and output UI without model calls or modifying message bodies', async () => {
+  const h = harness();
+  const sent = await h.run('prompt.submit', prompt);
+  const userMessage = { uuid: 'user-1', message: { type: 'user', content: [{ type: 'text', text: sent.text }] } };
+  assert.equal(await h.run('session.append', userMessage), userMessage);
+  const assistantMessage = { uuid: 'assistant-1', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } };
+  assert.equal(await h.run('session.append', assistantMessage), assistantMessage);
+  h.$.process.run = async () => codexResult('已修复问题。');
+  await h.run('turn.complete', finish);
+  assert.equal(userMessage.message.content[0].text, 'Translated text');
+  assert.equal(assistantMessage.message.content[0].text, 'Fixed the bug.');
+
+  const restored = harness({}, h.store);
+  restored.$.session.messages = async () => { throw new Error('UI restoration must not read model context'); };
+  await restored.run('session.start', {});
+  const userRow = { component: 'UserMessage', requestId: 'user-1', props: { text: sent.text } };
+  const shownUser = await restored.run('ui.render', userRow);
+  assert.equal(shownUser.props.children[0].props.text, prompt.text);
+  const assistantRow = { component: 'AssistantMessage', requestId: 'assistant-1', props: { text: finish.answer } };
+  assert.equal((await restored.run('ui.render', assistantRow)).props.text, `${finish.answer}\n\n---\n\n已修复问题。`);
+  assert.equal(assistantRow.props.text, finish.answer);
+  assert.equal(restored.calls.length, 0);
+
+  restored.$.session.id = async () => 'different-session';
+  assert.equal(await restored.run('ui.render', assistantRow), assistantRow);
+  assert.equal(await restored.run('ui.render', userRow), userRow);
+});
+
+test('old inline translations survive beyond the 20-card panel and restore lazily on hot reload', async () => {
+  const h = harness();
+  for (let i = 0; i < 23; i++) {
+    await h.run('session.append', { uuid: `reply-${i}`, message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+    await h.run('turn.complete', { ...finish, turnId: `turn-${i}` });
+  }
+  const restored = harness({}, h.store);
+  const row = { component: 'AssistantMessage', requestId: 'reply-0', props: { text: finish.answer } };
+  assert.match((await restored.run('ui.render', row)).props.text, /Translated text/);
+  assert.equal(restored.calls.length, 0);
+});
+
+test('a display-cache write failure preserves the completed translation and original reply', async () => {
+  const h = harness();
+  h.$.store.set = async () => { throw new Error('disk full'); };
+  await h.run('session.append', { uuid: 'reply-1', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+  assert.equal(await h.run('turn.complete', finish), finish);
+  const row = { component: 'AssistantMessage', requestId: 'reply-1', props: { text: finish.answer } };
+  assert.match((await h.run('ui.render', row)).props.text, /Translated text/);
+  assert.equal(h.notices.length, 1);
+  assert.match(h.notices[0], /缓存保存失败/);
+});
+
+test('display cache evicts oldest records at capacity but a single oversized reply preserves the cache', async () => {
+  const h = harness();
+  h.$.process.run = async () => codexResult('中'.repeat(200000));
+  for (let i = 0; i < 4; i++) {
+    await h.run('session.append', { uuid: `bounded-${i}`, message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+    await h.run('turn.complete', { ...finish, turnId: `bounded-${i}` });
+  }
+  const before = h.store.get('translation-ui:v1');
+  assert.ok(JSON.stringify(before).length <= 800000);
+  assert.equal(before.cards.some(card => card.messageId === 'bounded-0'), false);
+  assert.equal(before.cards.at(-1).messageId, 'bounded-3');
+  h.$.process.run = async () => codexResult('中'.repeat(800001));
+  await h.run('session.append', { uuid: 'oversized', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+  await h.run('turn.complete', { ...finish, turnId: 'oversized' });
+  assert.equal(h.store.get('translation-ui:v1'), before);
+  assert.match(h.notices.at(-1), /超过显示缓存容量/);
+});
 
 test('Chinese detection excludes code-only Chinese, English, and kana', () => {
   assert.equal(containsChinese('请 fix bug'), true);
@@ -53,7 +229,7 @@ test('Chinese detection excludes code-only Chinese, English, and kana', () => {
   for (const text of ['Hello', '```js\n// 中文\n```', '`中文`', '日本語です']) assert.equal(containsChinese(text), false);
 });
 test('translates input with session, transcript, context, model and stdin, preserving attachments', async () => {
-  const h = harness({ codex_model: 'chosen-model' });
+  const h = harness({ codex_model: 'chosen-model', translation_context: true });
   await h.run('classic.SessionStart', { session_id: 'session-123', transcript_path: '/history/session-123.jsonl' });
   const attachments = [{ type: 'image', data: 'unchanged' }];
   const context = ['existing context'];
@@ -132,13 +308,13 @@ test('history is bounded, keeps newest prose, excludes tool records', () => {
 });
 
 test('input and output reuse a persistent Codex session across plugin reloads', async () => {
-  const h = harness();
+  const h = harness({ translation_context: true });
   await h.run('prompt.submit', prompt);
   assert.ok(!h.calls[0].argv.includes('--ephemeral'));
   assert.ok(!h.calls[0].argv.includes('resume'));
   await h.run('turn.complete', finish);
   assert.deepEqual(h.calls[1].argv.slice(-3), ['resume', 'codex-thread-123', '-']);
-  const reloaded = harness({}, h.store);
+  const reloaded = harness({ translation_context: true }, h.store);
   await reloaded.run('prompt.submit', prompt);
   assert.deepEqual(reloaded.calls[0].argv.slice(-3), ['resume', 'codex-thread-123', '-']);
   reloaded.$.session.id = async () => 'another-claude-session';
@@ -147,7 +323,7 @@ test('input and output reuse a persistent Codex session across plugin reloads', 
 });
 
 test('reset creates a new session; model changes keep the association', async () => {
-  const h = harness();
+  const h = harness({ translation_context: true });
   await h.run('prompt.submit', prompt);
   await h.run('command.run', { args: 'model another-model' });
   await h.run('prompt.submit', prompt);
@@ -159,7 +335,7 @@ test('reset creates a new session; model changes keep the association', async ()
 });
 
 test('concurrent translations serialize and the second resumes the first', async () => {
-  const h = harness();
+  const h = harness({ translation_context: true });
   let release;
   let started;
   const ready = new Promise(resolve => { started = resolve; });
@@ -181,7 +357,7 @@ test('concurrent translations serialize and the second resumes the first', async
 });
 
 test('failed resume retains mapping, releases queue and does not silently start fresh', async () => {
-  const h = harness();
+  const h = harness({ translation_context: true });
   await h.run('prompt.submit', prompt);
   h.$.process.run = async () => ({ exitCode: 1, stdout: '', stderr: 'failed' });
   assert.ok((await h.run('prompt.submit', prompt)).drop);
@@ -297,11 +473,15 @@ test('Chinese output is rendered inline only on the final block of its own messa
   assert.equal(h.opened.length, 0);
 });
 
-test('context off uses ephemeral Codex with source text only and no history/store access', async () => {
-  const h = harness({ translation_context: false });
-  h.$.session.id = h.$.session.messages = h.$.store.get = h.$.store.set = async () => {
-    throw new Error('must not read session context');
+test('default context off sends only source text and never reads conversation or Codex association', async () => {
+  const h = harness();
+  h.$.session.messages = async () => { throw new Error('must not read conversation'); };
+  const get = h.$.store.get;
+  h.$.store.get = async key => {
+    assert.ok(!key.startsWith('codex-session:'));
+    return get(key);
   };
+  assert.match((await h.run('command.run', { args: 'status' })).text, /上下文：关/);
   const result = await h.run('prompt.submit', prompt);
   assert.equal(result.text, 'Translated text');
   const { argv, init } = h.calls[0];
@@ -314,7 +494,7 @@ test('context off uses ephemeral Codex with source text only and no history/stor
 });
 
 test('context toggle affects input and output without deleting the existing Codex association', async () => {
-  const h = harness();
+  const h = harness({ translation_context: true });
   await h.run('prompt.submit', prompt);
   const saved = h.store.get('codex-session:session-123');
   const status = await h.run('command.run', { args: 'context off' });
