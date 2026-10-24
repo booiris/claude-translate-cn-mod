@@ -424,14 +424,15 @@ test('pane supports history navigation, original toggle, show and hide', async (
   assert.equal(await h.run('ui.render', otherPane), otherPane);
 });
 
-test('UI failure does not prevent prompt submission and headless gets one complete log', async () => {
+test('UI failure does not prevent prompt submission and headless output is untouched', async () => {
   const h = harness();
   h.$.ui.open = async () => { throw new Error('UI unavailable'); };
   assert.ok((await h.run('prompt.submit', prompt)).text.includes('Translated text'));
   h.$.session.surfaces = async () => [];
   h.$.process.run = async () => codexResult('第一段\n\n第二段');
   await h.run('turn.complete', finish);
-  assert.deepEqual(h.logs, ['第一段\n\n第二段\n\n耗时: 0.0s']);
+  assert.deepEqual(h.logs, []);
+  assert.equal(h.calls.length, 1);
 });
 
 test('long content is paginated without losing text or breaking Unicode', () => {
@@ -582,18 +583,15 @@ test('translation usage appears in all views and survives reload without enterin
       assert.ok(nodes(pane).some(node => node.type === 'Text' && node.props.children === footer));
     }
     assert.equal(restored.calls.length, 0);
-    h.$.session.surfaces = async () => [];
-    await h.run('turn.complete', { ...finish, turnId: 't2' });
-    assert.deepEqual(h.logs, [`译文\n\n${footer}`]);
+    assert.deepEqual(h.logs, []);
   }
 });
 
 test('usage preserves zero counters and treats missing or invalid counters as unknown', async () => {
   const h = harness();
-  h.$.session.surfaces = async () => [];
   h.$.process.run = async () => codexResult('译文', { input_tokens: 0, output_tokens: -1, cached_input_tokens: '20' });
   await h.run('turn.complete', finish);
-  assert.deepEqual(h.logs, ['译文\n\nInput token: 0 · Output token: 未知 · Cache token: 未知 · 耗时: 0.0s']);
+  assert.ok(nodes(await h.run('ui.render', paneEvent)).some(node => node.props.children === 'Input token: 0 · Output token: 未知 · Cache token: 未知 · 耗时: 0.0s'));
   assert.equal(parseCodexResult(codexResult('译文', { input_tokens: 123 }), true).usage.input_tokens, 123);
 });
 
@@ -633,14 +631,12 @@ test('legacy translation sessions are replaced to avoid stale target-language in
 
 test('resumed usage is per translation and retains the cumulative baseline across reloads', async () => {
   const h = harness({ translation_context: true });
-  h.$.session.surfaces = async () => [];
   h.$.process.run = async () => codexResult('first', { input_tokens: 1000, output_tokens: 20, cached_input_tokens: 500 });
   await h.run('turn.complete', finish);
   const restored = harness({ translation_context: true }, h.store);
-  restored.$.session.surfaces = async () => [];
   restored.$.process.run = async () => codexResult('second', { input_tokens: 2200, output_tokens: 50, cached_input_tokens: 1300 });
   await restored.run('turn.complete', finish);
-  assert.deepEqual(restored.logs, ['second\n\nInput token: 1200 · Output token: 30 · Cache token: 800 · 耗时: 0.0s']);
+  assert.ok(nodes(await restored.run('ui.render', paneEvent)).some(node => node.props.children === 'Input token: 1200 · Output token: 30 · Cache token: 800 · 耗时: 0.0s'));
   assert.equal(restored.store.get('codex-session:session-123').usage.input_tokens, 2200);
 });
 
@@ -689,4 +685,37 @@ test('elapsed translation time is displayed with usage and survives reload', asy
     assert.ok(nodes(tree).some(node => node.type === 'Text' && node.props.children === 'Input token: 10 · Output token: 2 · Cache token: 0 · 耗时: 1.3s'));
   }
   assert.equal(restored.calls.length, 0);
+});
+
+
+test('SDK and print sessions bypass both translations even with an attached surface', async () => {
+  for (const surfaces of [[], ['terminal']]) {
+    const h = harness();
+    h.$.session.surfaces = async () => surfaces;
+    await h.run('session.start', { isInteractive: false, surface: null });
+    for (const kind of ['sdk', 'composer']) {
+      const input = { ...prompt, origin: { kind } };
+      assert.equal(await h.run('prompt.submit', input), input);
+    }
+    assert.equal(await h.run('turn.complete', finish), finish);
+    assert.equal(h.calls.length, 0);
+    assert.deepEqual(h.logs, []);
+    assert.equal(h.timers.length, 0);
+  }
+});
+
+test('headless hot reload bypasses translation without session.start, while interactive bridge works', async () => {
+  const h = harness();
+  h.$.session.surfaces = async () => [];
+  assert.equal(await h.run('prompt.submit', prompt), prompt);
+  assert.equal(await h.run('turn.complete', finish), finish);
+  assert.equal(h.calls.length, 0);
+  h.$.session.surfaces = async () => ['terminal'];
+  const sdk = { ...prompt, origin: { kind: 'sdk' } };
+  assert.equal(await h.run('prompt.submit', sdk), sdk);
+  assert.equal(h.calls.length, 0);
+  const result = await h.run('prompt.submit', { ...prompt, origin: { kind: 'bridge' } });
+  assert.equal(result.text, 'Translated text');
+  await h.run('turn.complete', finish);
+  assert.equal(h.calls.length, 2);
 });

@@ -147,7 +147,7 @@ claude --plugin-dir /absolute/path/to/claude-translate-cn-mod
 
 **支持 `claude -p` 或 SDK 吗？**
 
-这类调用没有图形面板，输出译文通过 `ui_log` 事件发送，原始 result 保持不变。调用方需要自行读取该事件。
+不翻译。`claude -p` 和 SDK 会话的输入、输出均原样传递，不调用 Codex，也不发送翻译 `ui_log`。翻译仅面向交互式终端和交互式会话中的 Remote Control 输入。
 
 ## 开发
 

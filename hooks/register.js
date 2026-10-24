@@ -61,11 +61,6 @@ function usageFooter(card) {
   return parts.join(' · ');
 }
 
-function displayedTranslation(card) {
-  const footer = usageFooter(card);
-  return card.translated + (footer ? `\n\n${footer}` : '');
-}
-
 function waitWithSignal(promise, signal) {
   return new Promise((resolve, reject) => {
     const abort = () => { cleanup(); reject(new Error('翻译已取消')); };
@@ -357,6 +352,7 @@ export function register(on, options = {}) {
     binary: options.codex_binary || 'codex',
     timeout: Math.min(600000, Math.max(1000, Number(options.timeout_ms) || 120000)),
   };
+  let isInteractive;
   const paths = new Map();
   const completed = new Set();
   const queues = new Map();
@@ -403,6 +399,7 @@ export function register(on, options = {}) {
     return next(e);
   });
   on('session.start', async ($, e, next) => {
+    isInteractive = e.isInteractive;
     await $.command.register({ name: 'translate', description: 'Codex 翻译开关及模型设置',
       argumentHint: '[show | hide | status | input/output/context on/off | model [ID/default] | models | reset]' });
     const result = await next(e);
@@ -448,7 +445,8 @@ export function register(on, options = {}) {
     return { text: `输入翻译：${config.input ? '开' : '关'}；最终输出翻译：${config.output ? '开' : '关'}；上下文：${config.context ? '开（复用会话）' : '关（临时会话）'}；Codex 模型：${config.model || '默认'}（设置仅当前加载期间有效，持久设置请使用 /config）` };
   });
   on('prompt.submit', async ($, e, next) => {
-    if (!['composer', 'bridge', 'sdk'].includes(e.origin?.kind)) return next(e);
+    if (isInteractive === false || !['composer', 'bridge'].includes(e.origin?.kind)) return next(e);
+    if (!(await $.session.surfaces()).length) return next(e);
     if (!config.input || !containsChinese(e.text)) return next(e);
     const sessionId = await restorePanel($, panel, cache);
     let translation;
@@ -533,6 +531,7 @@ export function register(on, options = {}) {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e);
     if (!config.output || e.agentId || e.isAborted || !['answer', 'refusal'].includes(e.reason) || !e.answer.trim()) return result;
+    if (isInteractive === false || !(await $.session.surfaces()).length) return result;
     const sessionId = await restorePanel($, panel, cache);
     const key = `${sessionId}:${e.turnId}`;
     if (completed.has(key)) return result;
@@ -551,9 +550,6 @@ export function register(on, options = {}) {
       if ((await $.session.surfaces()).length) {
         $.ui.invalidate('ui.render');
         if (!reply?.id) $.ui.toast('中文译文已完成，输入 /translate show 查看。');
-      } else {
-        // Headless consumers receive one complete ui_log event, not N log rows.
-        $.ui.log(displayedTranslation(card));
       }
       return result;
     } catch {
