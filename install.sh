@@ -12,6 +12,7 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 command -v claude >/dev/null 2>&1 || { echo '未找到 claude，请先安装 Claude Code。' >&2; exit 1; }
+python3 -c 'import tomllib' >/dev/null 2>&1 || { echo '翻译需要 Python 3.11+，请先安装。' >&2; exit 1; }
 
 config_dir="${CLAUDE_CONFIG_DIR:-${HOME:?HOME 未设置}/.claude}"
 target_dir="$config_dir/skills/codex-translate"
@@ -37,7 +38,7 @@ fi
 runtime_dir="$stage_dir/runtime"
 mkdir -p "$runtime_dir/.claude-plugin" "$runtime_dir/hooks"
 cp "$source_dir/.claude-plugin/plugin.json" "$runtime_dir/.claude-plugin/"
-for name in hooks.json register.js model_catalog.py; do
+for name in hooks.json register.js model_catalog.py translation_runner.py translation-instructions.txt; do
   cp "$source_dir/hooks/$name" "$runtime_dir/hooks/"
 done
 cp "$source_dir/README.md" "$runtime_dir/"
@@ -46,7 +47,7 @@ claude plugin validate "$runtime_dir" </dev/null
 
 # Do not follow existing plugin symlinks when updating files.
 for relative in '' '/.claude-plugin' '/hooks' '/.claude-plugin/plugin.json' \
-  '/hooks/hooks.json' '/hooks/register.js' '/hooks/model_catalog.py' '/README.md' '/LICENSE'; do
+  '/hooks/translation_runner.py' '/hooks/translation-instructions.txt' '/hooks/hooks.json' '/hooks/register.js' '/hooks/model_catalog.py' '/README.md' '/LICENSE'; do
   if [[ -L "$target_dir$relative" ]]; then
     echo "安装目标含符号链接，请先检查并移除该链接：$target_dir$relative" >&2
     exit 1
@@ -62,9 +63,6 @@ echo "已安装：$target_dir"
 echo '重启 Claude，然后运行 /translate status。更新插件也运行同一脚本。'
 if ! command -v codex >/dev/null 2>&1; then
   echo '提示：还需要安装 Codex CLI 并执行 codex login，翻译才能工作。'
-fi
-if ! command -v python3 >/dev/null 2>&1; then
-  echo '提示：模型列表查询需要 python3；普通翻译不受影响。'
 fi
 if [[ -n "${CLAUDE_CODE_PLUGIN_DIRS:-}" ]]; then
   echo '提示：如果 CLAUDE_CODE_PLUGIN_DIRS 也包含本插件，请移除对应路径，避免重复加载。'

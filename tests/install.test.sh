@@ -19,6 +19,8 @@ bash "$project_dir/install.sh" --help >/dev/null
 [[ ! -e "$CLAUDE_CONFIG_DIR" ]]
 bash "$project_dir/install.sh" >/dev/null
 cmp "$project_dir/hooks/register.js" "$target/hooks/register.js"
+cmp "$project_dir/hooks/translation_runner.py" "$target/hooks/translation_runner.py"
+cmp "$project_dir/hooks/translation-instructions.txt" "$target/hooks/translation-instructions.txt"
 cmp "$project_dir/LICENSE" "$target/LICENSE"
 [[ -f "$target/hooks/model_catalog.py" && ! -d "$target/tests" && ! -d "$target/.git" ]]
 echo 'user settings' > "$CLAUDE_CONFIG_DIR/settings.json"
@@ -70,6 +72,8 @@ chmod +x "$fixture_dir/bin/gh"
 unset GH_TOKEN GITHUB_TOKEN
 cat "$project_dir/install.sh" | bash >/dev/null
 cmp "$project_dir/hooks/register.js" "$target/hooks/register.js"
+cmp "$project_dir/hooks/translation_runner.py" "$target/hooks/translation_runner.py"
+cmp "$project_dir/hooks/translation-instructions.txt" "$target/hooks/translation-instructions.txt"
 cmp "$project_dir/LICENSE" "$target/LICENSE"
 [[ ! -e "$target/auth.headers" && ! -e "$target/source.tar.gz" ]]
 echo 'previous version' > "$target/hooks/register.js"

@@ -112,9 +112,47 @@ def svg(screen, cols=100, rows=30):
     return '\n'.join(parts)
 
 
+def remove_redraw_frames(frames):
+    """Drop isolated partial redraws only when neighboring frames restore text."""
+    plain = [ANSI.sub('', item['screen']) for item in frames]
+    kept = []
+    for i, item in enumerate(frames):
+        if 0 < i < len(frames) - 1:
+            previous, current, following = plain[i - 1:i + 2]
+            shared = {line.strip() for line in previous.splitlines() if len(line.strip()) >= 20}
+            shared &= {line.strip() for line in following.splitlines()}
+            missing = shared - {line.strip() for line in current.splitlines()}
+            if (missing and len(current.strip()) < 0.85 * min(len(previous.strip()), len(following.strip()))
+                    and frames[i + 1]['time'] - item['time'] < 1):
+                continue
+        kept.append(item)
+    return kept
+
+
+def shorten_translation_waits(frames):
+    """Keep a few real frames per translation wait, totaling about one second."""
+    result = []
+    index = 0
+    while index < len(frames):
+        match = re.search(r'正在将(?:输入翻译为英文|最终回复翻译为中文)', frames[index]['screen'])
+        if not match:
+            result.append(frames[index])
+            index += 1
+            continue
+        end = index + 1
+        while end < len(frames) and match.group() in frames[end]['screen']:
+            end += 1
+        count = end - index
+        selected = sorted({index + round(i * (count - 1) / 3) for i in range(4)})
+        result.extend({**frames[i], 'delay': 25} for i in selected)
+        index = end
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--socket', required=True)
+    parser.add_argument('--socket', help='tmux socket; required when capturing.')
+    parser.add_argument('--replay', action='store_true', help='Render existing frames.json without recording again.')
     parser.add_argument('--target', default='recording')
     parser.add_argument('--seconds', type=float, default=120)
     parser.add_argument('--output', type=Path, default=Path('docs/demo.gif'))
@@ -122,21 +160,30 @@ def main():
                         help='Private directory for raw screen captures; review before sharing.')
     args = parser.parse_args()
     args.capture_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    frames = []
-    started = time.monotonic()
-    while time.monotonic() - started < args.seconds:
-        screen = subprocess.check_output(['tmux', '-S', args.socket, 'capture-pane',
-                                          '-e', '-p', '-t', args.target], text=True)
-        now = time.monotonic() - started
-        if not frames or screen != frames[-1]['screen']:
-            frames.append({'time': round(now, 3), 'screen': screen})
-        (args.capture_dir / 'frames.json').write_text(json.dumps(frames, ensure_ascii=False))
-        # A caller can end capture after a completed response without losing frames.
-        if (args.capture_dir / 'stop').exists():
-            break
-        time.sleep(0.6)
-    elapsed = time.monotonic() - started
-    print(f'Captured {len(frames)} real terminal frames over {elapsed:.1f}s.', flush=True)
+    if args.replay:
+        frames = json.loads((args.capture_dir / 'frames.json').read_text())
+        elapsed = frames[-1]['time']
+    else:
+        if not args.socket:
+            parser.error('--socket is required unless --replay is used')
+        frames = []
+        started = time.monotonic()
+        while time.monotonic() - started < args.seconds:
+            screen = subprocess.check_output(['tmux', '-S', args.socket, 'capture-pane',
+                                              '-e', '-p', '-t', args.target], text=True)
+            now = time.monotonic() - started
+            if not frames or screen != frames[-1]['screen']:
+                frames.append({'time': round(now, 3), 'screen': screen})
+            (args.capture_dir / 'frames.json').write_text(json.dumps(frames, ensure_ascii=False))
+            # A caller can end capture after a completed response without losing frames.
+            if (args.capture_dir / 'stop').exists():
+                break
+            time.sleep(0.6)
+        elapsed = time.monotonic() - started
+        print(f'Captured {len(frames)} real terminal frames over {elapsed:.1f}s.', flush=True)
+    stable = remove_redraw_frames(frames)
+    print(f'Removed {len(frames) - len(stable)} transient redraw frame(s).', flush=True)
+    frames = shorten_translation_waits(stable)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='claude-recording-render-') as tmp:
         command = ['magick']
@@ -146,8 +193,10 @@ def main():
             source.write_text(svg(item['screen']))
             subprocess.run(['magick', str(source), str(image)], check=True)
             next_time = frames[i + 1]['time'] if i + 1 < len(frames) else elapsed + 3
-            # Compress long unchanged waits, retaining all changed captured screens.
-            delay = max(10, min(200, round((next_time - item['time']) * 100)))
+            # Compress waits after removing isolated partial redraws.
+            delay = item.get('delay', max(10, min(200, round((next_time - item['time']) * 100))))
+            if i == len(frames) - 1:
+                delay = 400
             command.extend(['-delay', str(delay), str(image)])
         command.extend(['-loop', '0', '-layers', 'Optimize', str(args.output)])
         subprocess.run(command, check=True)

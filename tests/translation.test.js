@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register, containsChinese, recentContext, parseCodexResult, displayPages } from '../hooks/register.js';
+import { register, containsChinese, parseCodexResult, displayPages } from '../hooks/register.js';
 
-const codexResult = (text = 'Translated text') => ({ exitCode: 0, stdout: [
+const codexResult = (text = 'Translated text', usage = {}) => ({ exitCode: 0, stdout: [
   { type: 'thread.started', thread_id: 'codex-thread-123' },
   { type: 'item.completed', item: { type: 'command_execution', aggregated_output: 'not a translation' } },
   { type: 'item.completed', item: { type: 'agent_message', text } },
-  { type: 'turn.completed', usage: {} },
+  { type: 'turn.completed', usage },
 ].map(JSON.stringify).join('\n'), stderr: '' });
 
 function harness(options = {}, store = new Map()) {
@@ -24,7 +24,7 @@ function harness(options = {}, store = new Map()) {
   }, options);
   const $ = {
     plugin: { root: '/plugin' },
-    clock: { after: (ms, tick) => {
+    clock: { now: async () => 0, after: (ms, tick) => {
       const timer = { ms, tick, cancelled: false, cancel() { this.cancelled = true; } };
       deadlines.push(timer);
       return timer;
@@ -44,7 +44,10 @@ function harness(options = {}, store = new Map()) {
       resolve: () => Object.fromEntries(['Box', 'Text', 'Button', 'Markdown'].map(type => [type, props => ({ type, props })])) },
   };
   $.process.spawn = async function* ({ argv, cwd, input }) {
-    const result = await $.process.run(argv, { cwd, stdin: input });
+    assert.deepEqual(argv.slice(0, 2), ['python3', '/plugin/hooks/translation_runner.py']);
+    assert.equal(argv[2], '--transcript');
+    assert.equal(argv[4], '--');
+    const result = await $.process.run(argv.slice(5), { cwd, stdin: input, transcriptPath: argv[3] });
     if (result.stdout) yield { stream: 'stdout', text: result.stdout };
     return { code: result.exitCode, signal: null };
   };
@@ -173,7 +176,9 @@ test('resume restores input and output UI without model calls or modifying messa
   const shownUser = await restored.run('ui.render', userRow);
   assert.equal(shownUser.props.children[0].props.text, prompt.text);
   const assistantRow = { component: 'AssistantMessage', requestId: 'assistant-1', props: { text: finish.answer } };
-  assert.equal((await restored.run('ui.render', assistantRow)).props.text, `${finish.answer}\n\n---\n\n已修复问题。`);
+  const shownAssistant = await restored.run('ui.render', assistantRow);
+  assert.equal(shownAssistant.props.children[0], assistantRow);
+  assert.deepEqual(nodes(shownAssistant).filter(node => node.type === 'Markdown').map(node => node.props.text), ['已修复问题。']);
   assert.equal(assistantRow.props.text, finish.answer);
   assert.equal(restored.calls.length, 0);
 
@@ -190,7 +195,7 @@ test('old inline translations survive beyond the 20-card panel and restore lazil
   }
   const restored = harness({}, h.store);
   const row = { component: 'AssistantMessage', requestId: 'reply-0', props: { text: finish.answer } };
-  assert.match((await restored.run('ui.render', row)).props.text, /Translated text/);
+  assert.ok(nodes(await restored.run('ui.render', row)).some(node => node.type === 'Markdown' && node.props.text === 'Translated text'));
   assert.equal(restored.calls.length, 0);
 });
 
@@ -200,7 +205,7 @@ test('a display-cache write failure preserves the completed translation and orig
   await h.run('session.append', { uuid: 'reply-1', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
   assert.equal(await h.run('turn.complete', finish), finish);
   const row = { component: 'AssistantMessage', requestId: 'reply-1', props: { text: finish.answer } };
-  assert.match((await h.run('ui.render', row)).props.text, /Translated text/);
+  assert.ok(nodes(await h.run('ui.render', row)).some(node => node.type === 'Markdown' && node.props.text === 'Translated text'));
   assert.equal(h.notices.length, 1);
   assert.match(h.notices[0], /缓存保存失败/);
 });
@@ -245,10 +250,13 @@ test('translates input with session, transcript, context, model and stdin, prese
   assert.equal(argv.at(-1), '-');
   assert.ok(!argv.includes(prompt.text));
   const payload = JSON.parse(init.stdin.split('\n').at(-1));
-  assert.equal(payload.claude_session_id, 'session-123');
-  assert.equal(payload.claude_transcript_path, '/history/session-123.jsonl');
-  assert.equal(payload.recent_conversation[0].text, '术语是队列');
+  const instructions = JSON.parse(argv.find(arg => arg.startsWith('developer_instructions=')).split('=').slice(1).join('='));
+  assert.ok(instructions.includes('session-123'));
+  assert.ok(instructions.includes('/history/session-123.jsonl'));
+  assert.deepEqual(Object.keys(payload), ['target_language', 'source_text']);
+  assert.equal(payload.target_language, 'English');
   assert.equal(payload.source_text, prompt.text);
+  assert.equal(init.transcriptPath, '/history/session-123.jsonl');
 });
 test('input toggle leaves output translation enabled; model changes apply next call', async () => {
   const h = harness();
@@ -302,11 +310,6 @@ test('Codex parsing rejects incomplete, empty, malformed and failed responses', 
     assert.throws(() => parseCodexResult(result));
   }
 });
-test('history is bounded, keeps newest prose, excludes tool records', () => {
-  assert.deepEqual(recentContext([{ role: 'user', text: '123456' }, { role: 'tool', text: 'secret' },
-    { role: 'assistant', text: 'abc' }], 5), [{ role: 'user', text: '56' }, { role: 'assistant', text: 'abc' }]);
-});
-
 test('input and output reuse a persistent Codex session across plugin reloads', async () => {
   const h = harness({ translation_context: true });
   await h.run('prompt.submit', prompt);
@@ -428,7 +431,7 @@ test('UI failure does not prevent prompt submission and headless gets one comple
   h.$.session.surfaces = async () => [];
   h.$.process.run = async () => codexResult('第一段\n\n第二段');
   await h.run('turn.complete', finish);
-  assert.deepEqual(h.logs, ['第一段\n\n第二段']);
+  assert.deepEqual(h.logs, ['第一段\n\n第二段\n\n耗时: 0.0s']);
 });
 
 test('long content is paginated without losing text or breaking Unicode', () => {
@@ -463,8 +466,9 @@ test('Chinese output is rendered inline only on the final block of its own messa
   await h.run('turn.complete', { ...finish, answer: 'First block.\nFinal block.' });
   const row = { component: 'AssistantMessage', requestId: 'message-1', props: { text: 'Final block.', isFirstOfReply: false } };
   const result = await h.run('ui.render', row);
-  assert.equal(result.props.text, 'Final block.\n\n---\n\n**中文回复**\n\n- 一条说明');
-  assert.equal(result.props.isFirstOfReply, false);
+  assert.equal(result.props.children[0], row);
+  assert.deepEqual(nodes(result).filter(node => node.type === 'Markdown').map(node => node.props.text), ['**中文回复**\n\n- 一条说明']);
+  assert.equal(result.props.children[0].props.isFirstOfReply, false);
   const first = { ...row, props: { text: 'First block.' } };
   assert.equal(await h.run('ui.render', first), first);
   const other = { ...row, requestId: 'unrelated-message' };
@@ -487,7 +491,7 @@ test('default context off sends only source text and never reads conversation or
   const { argv, init } = h.calls[0];
   assert.ok(argv.includes('--ephemeral'));
   assert.ok(!argv.includes('resume'));
-  assert.deepEqual(JSON.parse(init.stdin.split('\n').at(-1)), { source_text: prompt.text });
+  assert.deepEqual(JSON.parse(init.stdin.split('\n').at(-1)), { target_language: 'English', source_text: prompt.text });
   assert.ok(!init.stdin.includes('claude_session_id'));
   assert.ok(!init.stdin.includes('recent_conversation'));
   assert.ok(!init.stdin.includes('transcript file'));
@@ -501,7 +505,7 @@ test('context toggle affects input and output without deleting the existing Code
   assert.ok(status.text.includes('关（临时会话）'));
   await h.run('turn.complete', finish);
   assert.ok(h.calls[1].argv.includes('--ephemeral'));
-  assert.deepEqual(JSON.parse(h.calls[1].init.stdin.split('\n').at(-1)), { source_text: finish.answer });
+  assert.deepEqual(JSON.parse(h.calls[1].init.stdin.split('\n').at(-1)), { target_language: 'Simplified Chinese', source_text: finish.answer });
   assert.equal(h.store.get('codex-session:session-123'), saved);
   await h.run('command.run', { args: 'context on' });
   await h.run('prompt.submit', prompt);
@@ -548,4 +552,141 @@ test('failure clears progress and model commands query sanitized model catalog',
   assert.ok((await h.run('command.run', { args: 'models' })).text.includes('another-model'));
   await h.run('command.run', { args: 'model explicit-model' });
   assert.ok((await h.run('command.run', { args: 'model' })).text.includes('explicit-model'));
+});
+
+
+test('translation usage appears in all views and survives reload without entering prompts', async () => {
+  const usage = { input_tokens: 1200, output_tokens: 80, cached_input_tokens: 1024 };
+  const footer = 'Input token: 1200 · Output token: 80 · Cache token: 1024 · 耗时: 0.0s';
+  for (const context of [false, true]) {
+    const h = harness({ translation_context: context });
+    let calls = 0;
+    h.$.process.run = async () => {
+      calls++;
+      return codexResult('译文', Object.fromEntries(Object.entries(usage).map(([key, value]) => [key, value * (context ? calls : 1)])));
+    };
+    const sent = await h.run('prompt.submit', prompt);
+    assert.equal(sent.text, '译文');
+    await h.run('session.append', { uuid: 'u1', message: { type: 'user', content: [{ type: 'text', text: sent.text }] } });
+    await h.run('session.append', { uuid: 'a1', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+    await h.run('turn.complete', finish);
+    const restored = harness({}, h.store);
+    for (const view of [h, restored]) {
+      const input = await view.run('ui.render', { component: 'UserMessage', requestId: 'u1', props: { text: sent.text } });
+      assert.ok(nodes(input).some(node => node.type === 'Text' && node.props.children === footer));
+      const output = await view.run('ui.render', { component: 'AssistantMessage', requestId: 'a1', props: { text: finish.answer } });
+      assert.equal(output.props.children[0].props.text, finish.answer);
+      assert.deepEqual(nodes(output).filter(node => node.type === 'Markdown').map(node => node.props.text), ['译文']);
+      assert.ok(nodes(output).some(node => node.type === 'Text' && node.props.children === footer));
+      const pane = await view.run('ui.render', paneEvent);
+      assert.ok(nodes(pane).some(node => node.type === 'Text' && node.props.children === footer));
+    }
+    assert.equal(restored.calls.length, 0);
+    h.$.session.surfaces = async () => [];
+    await h.run('turn.complete', { ...finish, turnId: 't2' });
+    assert.deepEqual(h.logs, [`译文\n\n${footer}`]);
+  }
+});
+
+test('usage preserves zero counters and treats missing or invalid counters as unknown', async () => {
+  const h = harness();
+  h.$.session.surfaces = async () => [];
+  h.$.process.run = async () => codexResult('译文', { input_tokens: 0, output_tokens: -1, cached_input_tokens: '20' });
+  await h.run('turn.complete', finish);
+  assert.deepEqual(h.logs, ['译文\n\nInput token: 0 · Output token: 未知 · Cache token: 未知 · 耗时: 0.0s']);
+  assert.equal(parseCodexResult(codexResult('译文', { input_tokens: 123 }), true).usage.input_tokens, 123);
+});
+
+
+test('resumed translation sends new text and target language without resending history', async () => {
+  const h = harness({ translation_context: true });
+  h.$.session.messages = async () => { throw new Error('must not resend conversation'); };
+  await h.run('classic.SessionStart', { session_id: 'session-123', transcript_path: '/history/old.jsonl' });
+  await h.run('prompt.submit', prompt);
+  await h.run('turn.complete', finish);
+  assert.deepEqual(h.calls[1].argv.slice(-3), ['resume', 'codex-thread-123', '-']);
+  for (const call of h.calls) {
+    assert.ok(call.argv.includes('model_instructions_file="/plugin/hooks/translation-instructions.txt"'));
+    assert.ok(call.argv.includes('project_doc_max_bytes=0'));
+    assert.deepEqual(Object.keys(JSON.parse(call.init.stdin)), ['target_language', 'source_text']);
+  }
+  assert.ok(h.calls[1].argv.some(arg => arg.startsWith('developer_instructions=') && arg.includes('/history/old.jsonl')));
+  assert.ok(!h.calls[1].init.stdin.includes(prompt.text));
+  assert.equal(JSON.parse(h.calls[0].init.stdin).target_language, 'English');
+  assert.equal(JSON.parse(h.calls[1].init.stdin).target_language, 'Simplified Chinese');
+  await h.run('classic.Stop', { session_id: 'session-123', transcript_path: '/history/new.jsonl' });
+  await h.run('prompt.submit', prompt);
+  assert.ok(!h.calls[2].argv.includes('resume'));
+  assert.ok(h.calls[2].argv.some(arg => arg.startsWith('developer_instructions=') && arg.includes('/history/new.jsonl')));
+});
+
+
+test('legacy translation sessions are replaced to avoid stale target-language instructions', async () => {
+  const h = harness({ translation_context: true });
+  h.store.set('codex-session:session-123', { id: 'old-thread', binary: 'codex' });
+  await h.run('prompt.submit', prompt);
+  assert.ok(!h.calls[0].argv.includes('resume'));
+  await h.run('turn.complete', finish);
+  assert.ok(h.calls[1].argv.includes('resume'));
+});
+
+
+test('resumed usage is per translation and retains the cumulative baseline across reloads', async () => {
+  const h = harness({ translation_context: true });
+  h.$.session.surfaces = async () => [];
+  h.$.process.run = async () => codexResult('first', { input_tokens: 1000, output_tokens: 20, cached_input_tokens: 500 });
+  await h.run('turn.complete', finish);
+  const restored = harness({ translation_context: true }, h.store);
+  restored.$.session.surfaces = async () => [];
+  restored.$.process.run = async () => codexResult('second', { input_tokens: 2200, output_tokens: 50, cached_input_tokens: 1300 });
+  await restored.run('turn.complete', finish);
+  assert.deepEqual(restored.logs, ['second\n\nInput token: 1200 · Output token: 30 · Cache token: 800 · 耗时: 0.0s']);
+  assert.equal(restored.store.get('codex-session:session-123').usage.input_tokens, 2200);
+});
+
+
+test('inline Chinese Markdown keeps formatting separate from usage and preserves original renderer', async () => {
+  const h = harness();
+  const markdown = '## 说明\n\n**加粗**和*斜体*\n\n- 列表项\n\n```js\nconst value = 1;\n```';
+  h.$.process.run = async () => codexResult(markdown, { input_tokens: 100, output_tokens: 20, cached_input_tokens: 0 });
+  await h.run('session.append', { uuid: 'md1', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+  await h.run('turn.complete', finish);
+  const row = { component: 'AssistantMessage', requestId: 'md1', props: { text: finish.answer, onScreen: null, isFirstOfReply: true } };
+  const original = { type: 'NativeReply', props: {} };
+  let calls = 0;
+  const rendered = await h.run('ui.render', row, async event => {
+    calls++;
+    assert.equal(event, row);
+    return original;
+  });
+  assert.equal(calls, 1);
+  assert.equal(rendered.props.children[0], original);
+  assert.equal(rendered.props.children[1].props.children[0].type, 'Text');
+  assert.equal(rendered.props.children[1].props.children[0].props.children, '─'.repeat(32));
+  assert.deepEqual(nodes(rendered).filter(node => node.type === 'Markdown').map(node => node.props.text), [markdown]);
+  assert.ok(nodes(rendered).some(node => node.type === 'Text' && node.props.children === 'Input token: 100 · Output token: 20 · Cache token: 0 · 耗时: 0.0s'));
+});
+
+
+test('elapsed translation time is displayed with usage and survives reload', async () => {
+  const h = harness();
+  let now = 1000;
+  h.$.clock.now = async () => now;
+  h.$.process.run = async () => { now += 1250; return codexResult('译文', { input_tokens: 10, output_tokens: 2, cached_input_tokens: 0 }); };
+  const sent = await h.run('prompt.submit', prompt);
+  assert.equal(sent.text, '译文');
+  await h.run('session.append', { uuid: 'timed-user', message: { type: 'user', content: [{ type: 'text', text: sent.text }] } });
+  await h.run('session.append', { uuid: 'timed-output', message: { type: 'assistant', content: [{ type: 'text', text: finish.answer }] } });
+  await h.run('turn.complete', finish);
+  assert.ok(h.store.get('translation-ui:v1').cards.every(card => card.elapsedMs === 1250));
+  const restored = harness({}, h.store);
+  for (const row of [
+    { component: 'UserMessage', requestId: 'timed-user', props: { text: sent.text } },
+    { component: 'AssistantMessage', requestId: 'timed-output', props: { text: finish.answer } },
+    paneEvent,
+  ]) {
+    const tree = await restored.run('ui.render', row);
+    assert.ok(nodes(tree).some(node => node.type === 'Text' && node.props.children === 'Input token: 10 · Output token: 2 · Cache token: 0 · 耗时: 1.3s'));
+  }
+  assert.equal(restored.calls.length, 0);
 });
