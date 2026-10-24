@@ -1,6 +1,6 @@
 {
   "name": "codex-translate",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Translate Chinese prompts and Claude's final replies with session-aware Codex CLI.",
   "userConfig": {
     "input_translation": { "type": "boolean", "title": "中文输入翻译", "description": "发送前将包含中文的输入译为英文，同时保留原始输入", "default": true },

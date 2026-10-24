@@ -6,6 +6,16 @@ This native Claude Code mod translates Chinese user prompts into English and fin
 
 ## 使用
 
+克隆私有仓库后，一条命令安装或更新（需要当前 GitHub 账号有仓库权限）：
+
+```sh
+git clone git@github.com:booiris/claude-translate-mode.git
+cd claude-translate-mode
+bash install.sh
+```
+
+已有仓库时执行 `git pull && bash install.sh`。默认安装到 `~/.claude/skills/codex-translate/`，也支持 `CLAUDE_CONFIG_DIR` 指定的 Claude 配置目录。脚本先验证插件，只复制运行文件，不修改 Claude/Codex 配置或登录信息。安装后重启 Claude，运行 `/translate status` 验证。
+
 需要支持 Mods 的 Claude Code（开发验证版本：2.1.310）、已登录且支持 `codex exec --json` 和 `codex exec resume` 的 Codex CLI。翻译无需 npm install、Node 或构建步骤；模型目录查询另外需要 `python3` 和支持 `app-server` 的 Codex。测试使用 Node 20+。
 
 先自行完成 `codex login`，然后在需要工作的项目目录启动：
@@ -61,8 +71,8 @@ claude --plugin-dir /data/claude-translate-mode
 如果之前将插件复制安装到 Claude 目录，更新后重启 Claude：
 
 ```sh
-cp -R /data/claude-translate-mode/{.claude-plugin,hooks,README.md} \
-  ~/.claude/skills/codex-translate/
+cd /data/claude-translate-mode
+bash install.sh
 ```
 
 ## 行为边界
@@ -83,6 +93,7 @@ cp -R /data/claude-translate-mode/{.claude-plugin,hooks,README.md} \
 ```sh
 npm test
 npm run test:models
+npm run test:install
 claude plugin validate .
 claude plugin test .
 ```

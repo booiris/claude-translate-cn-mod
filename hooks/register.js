@@ -194,7 +194,6 @@ function renderPanel($, e, state) {
       children.push(Text({ dimColor: true, children: card.kind === 'input' ? '原始输入' : 'Claude 原文' }));
       children.push(Markdown({ text: sourcePages[page], dimColor: true }));
     }
-    children.push(Text({ bold: true, children: card.kind === 'input' ? '英文译文' : '中文回复' }));
     if (translatedPages[page] !== undefined) children.push(Markdown({ text: translatedPages[page] }));
     if (pageCount > 1) children.push(Box({ flexDirection: 'row', gap: 1, children: [
       Button({ key: 'page-back', label: '上一页', onPress: () => {
@@ -350,11 +349,10 @@ export function register(on, options = {}) {
       (item.messageId ? item.messageId === e.requestId : true));
     if (!card) return next(e);
     const original = await next({ ...e, props: { ...e.props, text: card.original } });
-    const { Box, Text, Markdown } = $.ui.resolve(e);
+    const { Box, Markdown } = $.ui.resolve(e);
     return Box({ flexDirection: 'column', children: [
       original,
       Box({ flexDirection: 'column', marginLeft: 2, marginTop: 1, children: [
-        Text({ dimColor: true, children: '英文译文' }),
         ...displayPages(card.translated).map(text => Markdown({ text, dimColor: true })),
       ] }),
     ] });
@@ -364,7 +362,7 @@ export function register(on, options = {}) {
     // A reply may contain several text blocks. Append only beneath its last one.
     if (!card || e.props.text !== card.lastBlock) return next(e);
     return next({ ...e, props: { ...e.props,
-      text: `${e.props.text}\n\n---\n\n### 中文译文\n\n${card.translated}`,
+      text: `${e.props.text}\n\n---\n\n${card.translated}`,
     } });
   });
   on('turn.complete', async ($, e, next) => {

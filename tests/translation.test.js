@@ -287,7 +287,7 @@ test('Chinese output is rendered inline only on the final block of its own messa
   await h.run('turn.complete', { ...finish, answer: 'First block.\nFinal block.' });
   const row = { component: 'AssistantMessage', requestId: 'message-1', props: { text: 'Final block.', isFirstOfReply: false } };
   const result = await h.run('ui.render', row);
-  assert.equal(result.props.text, 'Final block.\n\n---\n\n### 中文译文\n\n**中文回复**\n\n- 一条说明');
+  assert.equal(result.props.text, 'Final block.\n\n---\n\n**中文回复**\n\n- 一条说明');
   assert.equal(result.props.isFirstOfReply, false);
   const first = { ...row, props: { text: 'First block.' } };
   assert.equal(await h.run('ui.render', first), first);

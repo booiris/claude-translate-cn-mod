@@ -1,8 +1,8 @@
 {
   "name": "codex-translate",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node tests/translation.test.js", "test:models": "python3 -m unittest discover -s tests -p 'test_*.py'", "validate": "claude plugin validate .", "test:native": "claude plugin test ." },
+  "scripts": { "test": "node tests/translation.test.js", "test:install": "bash tests/install.test.sh", "test:models": "python3 -m unittest discover -s tests -p 'test_*.py'", "validate": "claude plugin validate .", "test:native": "claude plugin test ." },
   "engines": { "node": ">=20" }
 }
