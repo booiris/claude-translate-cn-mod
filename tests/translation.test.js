@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { register, containsChinese, parseCodexResult, displayPages } from '../hooks/register.js';
+import { register, containsChinese, shouldTranslate, parseCodexResult, displayPages } from '../hooks/register.js';
 
 const codexResult = (text = 'Translated text', usage = {}) => ({ exitCode: 0, stdout: [
   { type: 'thread.started', thread_id: 'codex-thread-123' },
@@ -59,6 +59,58 @@ function harness(options = {}, store = new Map()) {
 }
 const prompt = { text: '请修复这个 bug', origin: { kind: 'composer' }, wait: false };
 const finish = { turnId: 't1', answer: 'Fixed the bug.', reason: 'answer', isAborted: false };
+
+test('language thresholds require both count and ratio, including exact boundaries', () => {
+  assert.equal(shouldTranslate('修复 fix bug', 'en', 2, 0.5), true);
+  assert.equal(shouldTranslate('修 fix', 'en', 2, 0.5), false);
+  assert.equal(shouldTranslate('修复 please fix this bug', 'en', 2, 0.5), false);
+  assert.equal(shouldTranslate('已修复 fixed the bug', 'zh', 3, 0.5), true);
+  assert.equal(shouldTranslate('好 all done', 'zh', 3, 0.5), false);
+  assert.equal(shouldTranslate('问题已经全部修复 fixed the bug', 'zh', 3, 0.5), false);
+  for (const text of ['全部完成', '123 !!!', '```js\nconst result = fixBug();\n```',
+    '~~~js\nconst result = fixBug();\n~~~', '`Fixed the bug`',
+    '查看 https://example.com/fixed/the/bug', '[文档](https://example.com/fixed/the/bug)']) {
+    assert.equal(shouldTranslate(text, 'zh', 3, 0.5), false, text);
+  }
+  assert.equal(shouldTranslate('Fixed the bug\n```\n中文', 'zh', 3, 0.5), true);
+  assert.equal(shouldTranslate('[Fixed the bug](https://example.com)', 'zh', 3, 0.5), true);
+  assert.equal(shouldTranslate('日本語です', 'en', 2, 0.5), false);
+  assert.equal(shouldTranslate('', 'zh', 0, 0), false);
+});
+
+test('mixed-language input and output skip translation without progress, cache or notices', async () => {
+  const h = harness();
+  for (const text of ['Please fix this bug 谢谢', '好']) {
+    const event = { ...prompt, text };
+    assert.equal(await h.run('prompt.submit', event), event);
+  }
+  for (const answer of ['问题已经修复，添加了 unit tests 并更新 README。', '已完成全部修改。', 'All done.']) {
+    const event = { ...finish, answer };
+    assert.equal(await h.run('turn.complete', event), event);
+  }
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.timers.length, 0);
+  assert.equal(h.store.size, 0);
+  assert.deepEqual(h.notices, []);
+});
+
+test('threshold settings apply independently to each direction and reject invalid values', async () => {
+  const h = harness({ input_min_count: 1, input_min_ratio: 0, output_min_count: 1, output_min_ratio: 0 });
+  await h.run('prompt.submit', { ...prompt, text: 'Please fix this bug 谢' });
+  await h.run('turn.complete', { ...finish, answer: '已经全部完成 OK' });
+  assert.equal(h.calls.length, 2);
+  const strict = harness({ input_min_count: 100, output_min_ratio: 1 });
+  await strict.run('prompt.submit', prompt);
+  await strict.run('turn.complete', { ...finish, answer: '已修复 fixed the bug' });
+  assert.equal(strict.calls.length, 0);
+  for (const value of [-1, NaN, Infinity, '0', null]) {
+    const invalid = harness({ input_min_count: value, input_min_ratio: value,
+      output_min_count: value, output_min_ratio: value });
+    const status = (await invalid.run('command.run', { args: 'status' })).text;
+    assert.match(status, /输入阈值：2 字 \/ 50%/);
+    assert.match(status, /输出阈值：3 词 \/ 50%/);
+  }
+});
 
 function heldProcess(h) {
   let ready;

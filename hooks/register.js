@@ -5,6 +5,30 @@ export function containsChinese(text) {
   return /\p{Script=Han}/u.test(prose) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(prose);
 }
 
+function proseOnly(text) {
+  return text
+    .replace(/```[^\n]*\n[\s\S]*?(?:```|$)|~~~[^\n]*\n[\s\S]*?(?:~~~|$)|```[\s\S]*?```|`[^`\n]*`/g, ' ')
+    .replace(/!?\[([^\]]*)\]\([^\s)]*(?:\s+"[^"]*")?\)/g, '$1')
+    .replace(/https?:\/\/[^\s<>]+/gi, ' ');
+}
+
+// Count Han characters and English words as comparable language units; long
+// English identifiers should not outweigh a sentence of Chinese prose.
+export function shouldTranslate(text, target, minCount, minRatio) {
+  const prose = proseOnly(text);
+  const chinese = (prose.match(/\p{Script=Han}/gu) || []).length;
+  const english = (prose.match(/[a-zA-Z]+(?:['’-][a-zA-Z]+)*/g) || []).length;
+  const other = (prose.replace(/\p{Script=Han}|[a-zA-Z]/gu, '').match(/\p{L}/gu) || []).length;
+  if (target === 'en' && /[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(prose)) return false;
+  const count = target === 'en' ? chinese : english;
+  return count > 0 && count >= minCount && count / (chinese + english + other) >= minRatio;
+}
+
+function threshold(value, fallback, min, max, integer = false) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max &&
+    (!integer || Number.isInteger(value)) ? value : fallback;
+}
+
 export function translationPrompt(text, target) {
   return JSON.stringify({ target_language: target === 'en' ? 'English' : 'Simplified Chinese', source_text: text });
 }
@@ -351,6 +375,10 @@ export function register(on, options = {}) {
     model: options.codex_model || '',
     binary: options.codex_binary || 'codex',
     timeout: Math.min(600000, Math.max(1000, Number(options.timeout_ms) || 120000)),
+    inputMinCount: threshold(options.input_min_count, 2, 0, 100000, true),
+    inputMinRatio: threshold(options.input_min_ratio, 0.5, 0, 1),
+    outputMinCount: threshold(options.output_min_count, 3, 0, 100000, true),
+    outputMinRatio: threshold(options.output_min_ratio, 0.5, 0, 1),
   };
   let isInteractive;
   const paths = new Map();
@@ -442,12 +470,12 @@ export function register(on, options = {}) {
     } else if (action !== 'status' || value) {
       return { text: '用法：/translate [show | hide | status | input/output/context on/off | model [模型ID/default] | models | reset]' };
     }
-    return { text: `输入翻译：${config.input ? '开' : '关'}；最终输出翻译：${config.output ? '开' : '关'}；上下文：${config.context ? '开（复用会话）' : '关（临时会话）'}；Codex 模型：${config.model || '默认'}（设置仅当前加载期间有效，持久设置请使用 /config）` };
+    return { text: `输入翻译：${config.input ? '开' : '关'}；最终输出翻译：${config.output ? '开' : '关'}；上下文：${config.context ? '开（复用会话）' : '关（临时会话）'}；输入阈值：${config.inputMinCount} 字 / ${config.inputMinRatio * 100}%；输出阈值：${config.outputMinCount} 词 / ${config.outputMinRatio * 100}%；Codex 模型：${config.model || '默认'}（设置仅当前加载期间有效，持久设置请使用 /config）` };
   });
   on('prompt.submit', async ($, e, next) => {
     if (isInteractive === false || !['composer', 'bridge'].includes(e.origin?.kind)) return next(e);
     if (!(await $.session.surfaces()).length) return next(e);
-    if (!config.input || !containsChinese(e.text)) return next(e);
+    if (!config.input || !shouldTranslate(e.text, 'en', config.inputMinCount, config.inputMinRatio)) return next(e);
     const sessionId = await restorePanel($, panel, cache);
     let translation;
     const job = beginProgress($, progress, 'input', config);
@@ -531,6 +559,7 @@ export function register(on, options = {}) {
   on('turn.complete', async ($, e, next) => {
     const result = await next(e);
     if (!config.output || e.agentId || e.isAborted || !['answer', 'refusal'].includes(e.reason) || !e.answer.trim()) return result;
+    if (!shouldTranslate(e.answer, 'zh', config.outputMinCount, config.outputMinRatio)) return result;
     if (isInteractive === false || !(await $.session.surfaces()).length) return result;
     const sessionId = await restorePanel($, panel, cache);
     const key = `${sessionId}:${e.turnId}`;

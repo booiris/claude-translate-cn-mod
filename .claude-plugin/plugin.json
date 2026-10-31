@@ -6,7 +6,7 @@
     "input_translation": {
       "type": "boolean",
       "title": "中文输入翻译",
-      "description": "发送前将包含中文的输入译为英文，同时保留原始输入",
+      "description": "发送前将达到中文数量和占比阈值的输入译为英文，同时保留原始输入",
       "default": true
     },
     "output_translation": {
@@ -40,6 +40,38 @@
       "default": 120000,
       "min": 1000,
       "max": 600000
+    },
+    "input_min_count": {
+      "type": "number",
+      "title": "输入翻译最小字数",
+      "description": "触发输入翻译所需的最少汉字数（整数）；须同时满足占比阈值，排除代码和链接地址",
+      "default": 2,
+      "min": 0,
+      "max": 100000
+    },
+    "input_min_ratio": {
+      "type": "number",
+      "title": "输入翻译最小占比",
+      "description": "汉字数占正文语言单位的比例，汉字和英文单词各计一个单位；范围 0–1",
+      "default": 0.5,
+      "min": 0,
+      "max": 1
+    },
+    "output_min_count": {
+      "type": "number",
+      "title": "输出翻译最小字数",
+      "description": "触发输出翻译所需的最少英文单词数（整数）；须同时满足占比阈值，排除代码和链接地址",
+      "default": 3,
+      "min": 0,
+      "max": 100000
+    },
+    "output_min_ratio": {
+      "type": "number",
+      "title": "输出翻译最小占比",
+      "description": "英文单词数占正文语言单位的比例，汉字和英文单词各计一个单位；范围 0–1",
+      "default": 0.5,
+      "min": 0,
+      "max": 1
     }
   },
   "license": "MIT",
